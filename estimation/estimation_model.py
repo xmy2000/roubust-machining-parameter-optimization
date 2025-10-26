@@ -1,271 +1,357 @@
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import global_mean_pool
-from torch_geometric.data import Data, Batch
-import torch.distributions as dist
+from torch import nn
+import lightning as L
+from torch_geometric.nn import MLP, global_mean_pool
+from parameters import *
+from BayesianGCN import GCNConv
+from utils import adjacency_to_edge_weight
 from scipy.stats import norm
-from typing import Dict, List, Tuple
-from GCN_layers import GCNModule
 
 
-# --------------------------
-# 完整加工指标估计模型（3.2节核心）
-# --------------------------
-class CausalMachingIndicatorEstimator(nn.Module):
+class UnGCNLayer(nn.Module):
+    def __init__(self, node_feature_dim, hidden_dim):
+        super().__init__()
+        self.mean_gcn = GCNConv(mu=0, sigma=0.1, in_channels=node_feature_dim, out_channels=hidden_dim)
+        self.std_gcn = GCNConv(mu=0, sigma=0.1, in_channels=node_feature_dim, out_channels=hidden_dim)
+
+    def forward(self, mean, std, edge_index, edge_weight):
+        new_mean, kl_mean = self.mean_gcn(mean, edge_index, edge_weight)
+        var = std ** 2
+        new_log_var, kl_std = self.std_gcn(var, edge_index, edge_weight ** 2)
+        new_var = torch.exp(new_log_var) + 1e-6
+        new_std = torch.sqrt(new_var)
+        total_kl = kl_mean + kl_std
+        return new_mean, new_std, total_kl
+
+
+class GraphEncoder(nn.Module):
     def __init__(
             self,
-            node_type_dims: Dict[str, int],
-            gcn_hidden: int = 16,
-            causal_dim: int = 16,
-            num_gcn_propagation: int = 2,
-            prior_var: float = 1.0,
-            gru_layers: int = 2,
-            confidence_level: float = 0.95
+            node_feature_dim: int,
+            hidden_dim: int,
+            latent_dim: int,
+            num_propagation_layers: int,
+            num_samples: int = 1
     ):
         super().__init__()
-        self.node_types = list(node_type_dims.keys())
-        self.node_type_dims = node_type_dims
-        self.causal_dim = causal_dim
-        self.confidence_level = confidence_level
-        self.z_alpha = torch.tensor(norm.ppf((1 + confidence_level) / 2), dtype=torch.float32)  # 95%置信度对应zα=1.96
+        self.node_feature_dim = node_feature_dim
+        self.num_samples = num_samples
+        self.kl_total = 0.0
 
+        edge_index = [[i, j] for i in range(NUM_NODES) for j in range(NUM_NODES) if i != j]
+        self.edge_index = torch.tensor(edge_index, dtype=torch.long, device=DEVICE).t().contiguous()
+
+        self.init_mean_gcn = GCNConv(mu=0, sigma=0.1, in_channels=node_feature_dim, out_channels=hidden_dim)
+        self.init_std_gcn = GCNConv(mu=0, sigma=0.1, in_channels=node_feature_dim, out_channels=hidden_dim)
+
+        self.propagation_layers = nn.ModuleList()
+        for _ in range(num_propagation_layers):
+            out_dim = hidden_dim if _ < num_propagation_layers - 1 else latent_dim
+            self.propagation_layers.append(UnGCNLayer(node_feature_dim=hidden_dim, hidden_dim=out_dim))
+
+    def kl_loss(self) -> torch.Tensor:
+        return self.kl_total
+
+    def forward(self, x: torch.Tensor, adj_matrix: torch.Tensor):
+        self.kl_total = 0.0
+        edge_weight = adjacency_to_edge_weight(adj_matrix, self.edge_index)
+
+        init_mean, kl_init_mean = self.init_mean_gcn(x, self.edge_index, edge_weight)
+        init_log_var, kl_init_std = self.init_std_gcn(x, self.edge_index, edge_weight ** 2)
+        init_std = torch.sqrt(torch.exp(init_log_var) + 1e-6)
+        self.kl_total += kl_init_mean + kl_init_std
+
+        current_mean, current_std = init_mean, init_std
+        for prop_layer in self.propagation_layers:
+            current_mean, current_std, kl_prop = prop_layer(
+                mean=current_mean,
+                std=current_std,
+                edge_index=self.edge_index,
+                edge_weight=edge_weight
+            )
+            self.kl_total += kl_prop  # 累计传播层KL
+
+        normalized_kl = self.kl_total / self.num_samples
+        return current_mean, current_std, normalized_kl
+
+
+class NodeEncoder(nn.Module):
+    def __init__(self, node_feature_dim):
+        super(NodeEncoder, self).__init__()
+        self.node_feature_dim = node_feature_dim
         self.node_encoders = nn.ModuleDict()
-        for node_type, in_dim in node_type_dims.items():
-            self.node_encoders[node_type] = nn.Sequential(
-                nn.Linear(in_dim, gcn_hidden),
-                nn.ReLU(),
-                nn.Linear(gcn_hidden, gcn_hidden)
+        for k, v in NODES_DIM.items():
+            self.node_encoders[k] = nn.Linear(v, node_feature_dim)
+
+    def forward(self, x):
+        nodes_feature = torch.zeros((NUM_NODES, self.node_feature_dim), dtype=torch.float, device=DEVICE)
+        for n in NODES:
+            index = NODES.index(n)
+            nodes_feature[index] = self.node_encoders[n](x[index, :NODES_DIM[n]])
+        return nodes_feature
+
+
+class NodeDecoder(nn.Module):
+    def __init__(self, latent_dim, hidden_dim):
+        super(NodeDecoder, self).__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.node_decoders = nn.ModuleDict()
+        self.nn_logstd = nn.ModuleDict()
+        for k, v in NODES_DIM.items():
+            self.node_decoders[k] = MLP(
+                in_channels=latent_dim,
+                hidden_channels=hidden_dim,
+                out_channels=v,
+                num_layers=3,
+                norm="layer_norm",
+                act="swish"
+            )
+            self.nn_logstd[k] = MLP(
+                in_channels=latent_dim,
+                hidden_channels=hidden_dim,
+                out_channels=v,
+                num_layers=3,
+                norm="layer_norm",
+                act="swish"
             )
 
-        self.graph_encoder = GCNModule(
-            in_channels=gcn_hidden,
-            hidden_channels=gcn_hidden,
-            out_channels=gcn_hidden,
-            num_propagation_layers=num_gcn_propagation,
-            prior_var=prior_var
+    def forward(self, z):
+        x_recon = torch.zeros((NUM_NODES, MAX_NODE_DIM), dtype=torch.float, device=DEVICE)
+        x_logstd = torch.zeros((NUM_NODES, MAX_NODE_DIM), dtype=torch.float, device=DEVICE)
+        for n in NODES:
+            index = NODES.index(n)
+            x_recon[index, :NODES_DIM[n]] = self.node_decoders[n](z[index])
+            x_logstd[index, :NODES_DIM[n]] = self.nn_logstd[n](z[index])
+        return x_recon, x_logstd.exp()
+
+
+class CausalEncoder(nn.Module):
+    def __init__(
+            self,
+            latent_dim: int,
+            num_nodes: int,
+            adj_matrix: torch.Tensor = None  # 补充默认值
+    ):
+        super(CausalEncoder, self).__init__()
+        self.num_nodes = num_nodes
+        self.latent_dim = latent_dim
+
+        if adj_matrix is None:
+            adj_matrix = torch.randn(num_nodes, num_nodes, device=DEVICE) * 0.1
+        self.C = nn.Parameter(adj_matrix, requires_grad=True)
+        self.C.data.fill_diagonal_(0.0)
+
+        self.causal_mlp = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.Mish(),
+            nn.Linear(latent_dim, latent_dim)
+        )
+
+    def dag_constraint(self, A: torch.Tensor) -> torch.Tensor:
+        AC = A * self.C
+        I = torch.eye(self.num_nodes, device=DEVICE)
+        mat = I + AC
+        mat_pow = torch.matrix_power(mat, self.num_nodes)
+        h_c = torch.trace(mat_pow) - self.num_nodes
+        return h_c
+
+    def forward(self, z: torch.Tensor, A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        AC = A * self.C
+        I = torch.eye(self.num_nodes, device=DEVICE)
+        try:
+            inv_mat = torch.inverse(I - AC.T)
+        except:
+            inv_mat = torch.pinverse(I - AC.T)
+        z_causal = inv_mat @ z
+
+        z_recon = []
+        for node_idx in range(self.num_nodes):
+            parent_mask = (self.C[:, node_idx] != 0).float().unsqueeze(1)
+            parent_z = z_causal * parent_mask
+            z_i_recon = self.causal_mlp(parent_z.sum(dim=0, keepdim=True))
+            z_recon.append(z_i_recon)
+        z_recon = torch.cat(z_recon, dim=0)
+
+        dag_loss = self.dag_constraint(A)
+        return z_causal, z_recon, dag_loss
+
+
+class Model(L.LightningModule):
+    def __init__(
+            self,
+            node_feature_dim: int,
+            hidden_dim: int,
+            latent_dim: int,
+            dataset,
+            num_propagation_layers: int = 2,
+            num_uncertainty_samples: int = 30
+    ):
+        super(Model, self).__init__()
+        self.save_hyperparameters()
+        self.test_dataset = dataset
+        self.node_feature_dim = node_feature_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.num_nodes = NUM_NODES
+        self.num_propagation_layers = num_propagation_layers
+        self.num_uncertainty_samples = num_uncertainty_samples
+        self.confidence = 0.95
+        self.z_alpha = torch.tensor(norm.ppf((1 + self.confidence) / 2), device=DEVICE)
+
+        adj_matrix = torch.load("./data/new_adj_matrix.pt", weights_only=False)
+        self.adj_matrix = nn.Parameter(adj_matrix, requires_grad=True)
+
+        self.node_encoder = NodeEncoder(node_feature_dim=node_feature_dim)
+        self.graph_encoder = GraphEncoder(
+            node_feature_dim=node_feature_dim,
+            hidden_dim=hidden_dim,
+            latent_dim=latent_dim,
+            num_propagation_layers=num_propagation_layers,
+            num_samples=num_uncertainty_samples
+        )
+        self.node_decoder = NodeDecoder(latent_dim=latent_dim, hidden_dim=hidden_dim)
+        self.causal_encoder = CausalEncoder(
+            latent_dim=latent_dim,
+            num_nodes=self.num_nodes,
+            adj_matrix=self.adj_matrix
         )
 
         self.global_pool = global_mean_pool
         self.gru = nn.GRU(
-            input_size=gcn_hidden,
-            hidden_size=gcn_hidden,
-            num_layers=gru_layers,
-            batch_first=True
+            input_size=latent_dim,
+            hidden_size=latent_dim,
+            num_layers=2,
+            batch_first=True,
+            device=DEVICE
         )
 
-        self.num_nodes_per_graph = len(self.node_types)  # 每个加工图的节点数
-        self.causal_matrix = nn.Parameter(torch.randn(self.num_nodes_per_graph, self.num_nodes_per_graph) * 0.1)
-        self.causal_matrix.data.fill_diagonal_(0.0)  # 无自环（DAG基础约束）
-        self.causal_mlp = nn.Sequential(  # 公式13的g_i：子节点由父节点生成
-            nn.Linear(gcn_hidden, causal_dim),
-            nn.Mish(),  # 文档3.2.1节指定激活函数
-            nn.Linear(causal_dim, causal_dim)
-        )
+    def calc_pi_metrics(self, x: torch.Tensor, x_recon: torch.Tensor, x_std: torch.Tensor, node_mask: torch.Tensor):
+        x, x_recon, x_std = x[node_mask], x_recon[node_mask], x_std[node_mask]
+        pi_low = x_recon - self.z_alpha * x_std
+        pi_up = x_recon + self.z_alpha * x_std
 
-        self.node_decoders = nn.ModuleDict()
-        for node_type, out_dim in node_type_dims.items():
-            self.node_decoders[node_type] = nn.Sequential(
-                nn.Linear(causal_dim, gcn_hidden),
-                nn.Mish(),
-                nn.Linear(gcn_hidden, out_dim * 2)  # 输出：[均值, log(方差)]
-            )
-
-    def dag_constraint(self, edge_weight: torch.Tensor) -> torch.Tensor:
-        ac = edge_weight * self.causal_matrix  # A⊙C（元素-wise乘法，整合图拓扑不确定性）
-        i = torch.eye(self.num_nodes_per_graph, device=ac.device)
-        mat = i + ac
-        mat_pow = torch.matrix_power(mat, self.num_nodes_per_graph)  # (I+AC)^Nv
-        h_c = torch.trace(mat_pow) - self.num_nodes_per_graph  # 公式19
-        return h_c
-
-    def calc_pi_metrics(self, y_true: torch.Tensor, y_mean: torch.Tensor, y_var: torch.Tensor) -> Tuple[
-        torch.Tensor, torch.Tensor]:
-        # 计算预测区间：[y_mean - zα*σ, y_mean + zα*σ]
-        pi_low = y_mean - self.z_alpha * torch.sqrt(y_var + 1e-6)
-        pi_up = y_mean + self.z_alpha * torch.sqrt(y_var + 1e-6)
-
-        # PICP（公式17）
-        k = ((y_true >= pi_low) & (y_true <= pi_up)).float()
+        k = ((x >= pi_low) & (x <= pi_up)).float()
         picp = k.mean()
 
-        # PINAW（公式17，归一化到[y_min, y_max]范围）
-        y_min = y_true.min(dim=0, keepdim=True)[0]
-        y_max = y_true.max(dim=0, keepdim=True)[0]
         piw = (pi_up - pi_low) * k
-        pinaw = (piw.sum(dim=0) / (k.sum(dim=0) + 1e-6)) / (y_max - y_min + 1e-6)
-        pinaw = pinaw.mean()  # 平均PINAW
+        piw = piw.sum() / (k.sum() + 1e-6)
+        y_range = x.max() - x.min() + 1e-6
+        pinaw = piw / y_range
 
-        return picp, pinaw
+        return picp, pinaw, pi_low, pi_up
 
-    def forward(
-            self,
-            data_list: List[Data],
-            node_types_list: List[List[str]],  # 每个图的节点类型列表（与data_list对应）
-            hist_gru_hidden: torch.Tensor = None  # GRU历史隐藏状态（多道次切削时传递）
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        device = next(self.parameters()).device
-        batch = Batch.from_data_list(data_list)  # 批量处理图数据
-        batch_size = batch.num_graphs
-        z_alpha = self.z_alpha.to(device)
+    def uncertainty_decomposition(self, z_mean: torch.Tensor, z_std: torch.Tensor, node_mask: torch.Tensor):
+        x_std_valid = z_std[node_mask]
+        u_a = x_std_valid.pow(2).mean()
 
-        flat_node_types = []
-        for types in node_types_list:
-            flat_node_types.extend(types)
-        # 逐个节点编码
-        x_encoded_list = []
-        for i in range(batch.x.shape[0]):
-            node_type = flat_node_types[i]
-            x_encoded = self.node_encoders[node_type](batch.x[i].unsqueeze(0))
-            x_encoded_list.append(x_encoded)
-        x_encoded = torch.cat(x_encoded_list, dim=0)  # (total_nodes, gcn_hidden)
+        sample_means = []
+        for _ in range(self.num_uncertainty_samples):
+            sample_z_mean, _, _ = self.graph_encoder(self.node_encoder(z_mean), self.adj_matrix)
+            sample_means.append(sample_z_mean[node_mask].unsqueeze(0))
+        sample_means = torch.cat(sample_means, dim=0)
+        u_e = sample_means.var(dim=0).mean()
 
-        edge_weight_matrix = torch.zeros(batch_size, self.num_nodes_per_graph, self.num_nodes_per_graph, device=device)
-        for idx, data in enumerate(data_list):
-            ew = data.edge_weight if hasattr(data, "edge_weight") else torch.ones(data.edge_index.shape[1],
-                                                                                  device=device)
-            for (u, v), w in zip(data.edge_index.T, ew):
-                edge_weight_matrix[idx, u, v] = w
-        node_mean, node_std, gcn_kl_loss = self.graph_encoder(
-            x=x_encoded,
-            edge_index=batch.edge_index,
-            edge_weight=batch.edge_weight if hasattr(batch, "edge_weight") else torch.ones(batch.edge_index.shape[1],
-                                                                                           device=device)
-        )
-        node_var = node_std ** 2  # 随机不确定性（方差）
+        u_pred = u_a + u_e
+        return u_e, u_a, u_pred
 
-        graph_feat = self.global_pool(node_mean, batch.batch)  # (batch_size, gcn_hidden)
-        # GRU融合历史经验（初始隐藏状态为None时自动初始化）
-        gru_out, new_gru_hidden = self.gru(graph_feat.unsqueeze(1), hist_gru_hidden)  # (batch_size, 1, gcn_hidden)
-        gru_feat = gru_out.squeeze(1)  # (batch_size, gcn_hidden)
+    def forward(self, graph_sequence: list):
+        wear_memory = torch.zeros(NODES_DIM['tool_wear'], dtype=torch.float, device=DEVICE)
+        breakage_memory = torch.zeros(NODES_DIM['tool_breakage'], dtype=torch.float, device=DEVICE)
+        hist_emb = None
 
-        causal_z_list = []  # 因果表示z（每个图的节点级z）
-        causal_z_recon_list = []  # 掩码重建后的z（公式13）
-        dag_loss_list = []  # DAG约束损失（每个图）
-        for idx in range(batch_size):
-            # 提取当前图的节点均值、边权重矩阵
-            node_start = idx * self.num_nodes_per_graph
-            node_end = (idx + 1) * self.num_nodes_per_graph
-            current_node_mean = node_mean[node_start:node_end]  # (num_nodes, gcn_hidden)
-            current_ew_matrix = edge_weight_matrix[idx]  # (num_nodes, num_nodes)
+        rec_loss = 0.0,
+        log_likelihood = 0.0
+        interval_loss = 0.0
+        z_recon_loss = 0.0
+        dag_loss = 0.0
+        kl_total = 0.0
+        u_e_total = 0.0
+        u_a_total = 0.0
 
-            # 1. 因果结构建模（公式12：z = (I - (A⊙C)^T)^{-1} · ε_ex）
-            ac = current_ew_matrix * self.causal_matrix  # A⊙C
-            i = torch.eye(self.num_nodes_per_graph, device=device)
-            try:
-                inv_mat = torch.inverse(i - ac.T)  # 逆矩阵（DAG确保可逆）
-            except:
-                inv_mat = torch.pinverse(i - ac.T)  # 数值稳定：伪逆
-            eps_ex = current_node_mean  # 外源嵌入ε_ex（近似为节点均值，文档3.2.1节）
-            causal_z = inv_mat @ eps_ex  # 因果表示z（num_nodes, gcn_hidden）
+        seq_len = len(graph_sequence)
+        for graph in graph_sequence:
+            x, node_mask = graph.x, graph.node_mask[0]
+            x_clone = x.clone()
 
-            # 2. 掩码自重建（公式13：z_i仅由父节点生成）
-            causal_z_recon = []
-            for node_idx in range(self.num_nodes_per_graph):
-                # 掩码：仅保留当前节点的父节点（C[父节点, 当前节点]≠0）
-                parent_mask = (self.causal_matrix[:, node_idx] != 0).float().unsqueeze(1)  # (num_nodes, 1)
-                parent_z = causal_z * parent_mask  # 仅父节点信息
-                z_i_recon = self.causal_mlp(parent_z.sum(dim=0, keepdim=True))  # 父节点聚合
-                causal_z_recon.append(z_i_recon)
-            causal_z_recon = torch.cat(causal_z_recon, dim=0)  # (num_nodes, causal_dim)
+            x_clone[NODES.index('tool_wear'), :NODES_DIM['tool_wear']] = wear_memory
+            x_clone[NODES.index('tool_breakage'), :NODES_DIM['tool_breakage']] = breakage_memory
+            x_clone[NODES.index('cut'), :NODES_DIM['cut']] = 0.0
+            x_clone[NODES.index('roughness'), :NODES_DIM['roughness']] = 0.0
 
-            # 3. DAG约束损失（公式19）
-            dag_loss = self.dag_constraint(current_ew_matrix)
+            x_encode = self.node_encoder(x_clone)
 
-            # 收集结果
-            causal_z_list.append(causal_z)
-            causal_z_recon_list.append(causal_z_recon)
-            dag_loss_list.append(dag_loss)
+            z_mean, z_std, gcn_kl = self.graph_encoder(x_encode, self.adj_matrix)
+            kl_total += gcn_kl
 
-        # 批量整合因果表示
-        causal_z_batch = torch.cat(causal_z_list, dim=0)  # (total_nodes, causal_dim)
-        causal_z_recon_batch = torch.cat(causal_z_recon_list, dim=0)  # (total_nodes, causal_dim)
-        avg_dag_loss = torch.stack(dag_loss_list).mean()  # 批量平均DAG损失
+            graph_feat = self.global_pool(z_mean, graph.batch)
+            if hist_emb is None:
+                hist_emb = torch.zeros(2, 1, graph_feat.shape[1])
+            gru_out, hist_emb = self.gru(graph_feat.unsqueeze(1), hist_emb)
+            z_fused = z_mean + gru_out.squeeze(1)
 
-        y_pred_mean_list = []  # 加工指标预测均值
-        y_pred_var_list = []  # 加工指标预测方差（随机不确定性）
-        y_true_list = []  # 加工指标真实值（从data.y提取）
-        for idx in range(batch_size):
-            # 提取当前图的因果表示、真实标签
-            node_start = idx * self.num_nodes_per_graph
-            node_end = (idx + 1) * self.num_nodes_per_graph
-            current_z = causal_z_batch[node_start:node_end]
-            current_y_true = batch.y[node_start:node_end]  # 假设data.y存储节点真实值
+            z_causal, z_recon, dag_loss_step = self.causal_encoder(z_fused, self.adj_matrix)
+            dag_loss += dag_loss_step
+            z_recon_loss += F.mse_loss(z_causal, z_recon)
 
-            # 逐个节点解码
-            for node_idx in range(self.num_nodes_per_graph):
-                node_type = node_types_list[idx][node_idx]
-                # 解码输出：[均值, log(方差)]
-                dec_out = self.node_decoders[node_type](current_z[node_idx].unsqueeze(0))
-                out_dim = self.node_type_dims[node_type]
-                y_mean = dec_out[:, :out_dim]
-                y_log_var = dec_out[:, out_dim:]
-                y_var = torch.exp(y_log_var)  # 方差（确保非负）
+            x_recon, x_std = self.node_decoder(z_causal)
 
-                # 收集结果
-                y_pred_mean_list.append(y_mean)
-                y_pred_var_list.append(y_var)
-                y_true_list.append(current_y_true[node_idx].unsqueeze(0))
+            wear_memory = x_recon[NODES.index('tool_wear'), :NODES_DIM['tool_wear']]
+            breakage_memory = x_recon[NODES.index('tool_breakage'), :NODES_DIM['tool_breakage']]
 
-        # 批量整合预测结果
-        y_pred_mean = torch.cat(y_pred_mean_list, dim=0)  # (total_nodes, max_out_dim)
-        y_pred_var = torch.cat(y_pred_var_list, dim=0)  # (total_nodes, max_out_dim)
-        y_true = torch.cat(y_true_list, dim=0)  # (total_nodes, max_out_dim)
+            x_valid = x[node_mask]
+            x_recon_valid = x_recon[node_mask]
+            rec_loss += F.mse_loss(x_valid, x_recon_valid)
 
-        log_likelihood = dist.Normal(y_pred_mean, torch.sqrt(y_pred_var + 1e-6)).log_prob(y_true).mean()
-        elbo_loss = (gcn_kl_loss / batch_size) - log_likelihood  # KL按批量归一化
+            x_std_valid = x_std[node_mask]
+            log_like_step = -0.5 * torch.mean(
+                torch.log(x_std_valid.pow(2) + 1e-6) +
+                (x_valid - x_recon_valid).pow(2) / (x_std_valid.pow(2) + 1e-6)
+            )
+            log_likelihood += log_like_step
 
-        l_reg = 0.0  # 数值节点（如tool wear、Ra、Δ）
-        l_cls = 0.0  # 分类节点（如tool breakage）
-        reg_count = 0
-        cls_count = 0
-        for idx in range(y_true.shape[0]):
-            node_type = flat_node_types[idx % self.num_nodes_per_graph]
-            y_t = y_true[idx].unsqueeze(0)
-            y_m = y_pred_mean[idx].unsqueeze(0)
-            if node_type in ["tool", "quality", "param", "allowance"]:  # 数值节点（文档4.1节）
-                l_reg += F.mse_loss(y_m, y_t)
-                reg_count += 1
-            elif node_type == "breakage":  # 分类节点（0/1）
-                l_cls += F.binary_cross_entropy_with_logits(y_m, y_t)
-                cls_count += 1
-        l_rec = (l_reg / (reg_count + 1e-6)) + (l_cls / (cls_count + 1e-6))
+            picp, pinaw, _, _ = self.calc_pi_metrics(x, x_recon, x_std, node_mask)
+            interval_loss += pinaw - torch.sqrt(torch.tensor(self.num_nodes, device=DEVICE)) * picp
 
-        picp, pinaw = self.calc_pi_metrics(y_true, y_pred_mean, y_pred_var)
-        l_pi = pinaw - torch.sqrt(torch.tensor(self.num_nodes_per_graph, device=device)) * picp  # 公式17
+            u_e, u_a, _ = self.uncertainty_decomposition(z_mean, z_std, node_mask)
+            u_e_total += u_e
+            u_a_total += u_a
 
-        l_z = F.mse_loss(causal_z_batch, causal_z_recon_batch)
+        avg_metrics = {
+            "rec_loss": rec_loss / seq_len,
+            "elbo_loss": (kl_total / seq_len) - (log_likelihood / seq_len),
+            "interval_loss": interval_loss / seq_len,
+            "z_recon_loss": z_recon_loss / seq_len,
+            "dag_loss": dag_loss / seq_len,
+            "kl_loss": kl_total / seq_len,
+            "u_e": u_e_total / seq_len,
+            "u_a": u_a_total / seq_len,
+            "u_pred": (u_e_total + u_a_total) / seq_len,
+            "picp": picp,
+            "pinaw": pinaw
+        }
+        return avg_metrics
 
-        dag_loss = avg_dag_loss
+    def cal_loss(self, graph_sequence: list):
+        forward_out = self.forward(graph_sequence)
 
-        total_loss = torch.pow(
-            elbo_loss * l_rec * l_pi * l_z * (dag_loss + 1e-6),  # +1e-6避免0值
-            1.0 / 5.0
+        elbo_loss = forward_out["elbo_loss"].clamp(min=1e-6)
+        rec_loss = forward_out["rec_loss"].clamp(min=1e-6)
+        pi_loss = forward_out["interval_loss"].abs().clamp(min=1e-6)
+        z_loss = forward_out["z_recon_loss"].clamp(min=1e-6)
+        dag_loss = (forward_out["dag_loss"] + 1.0).clamp(min=1e-6)
+
+        total_loss = torch.pow(elbo_loss * rec_loss * pi_loss * z_loss * dag_loss, 1.0 / 5.0)
+
+        return (
+            total_loss,
+            forward_out["rec_loss"],
+            forward_out["elbo_loss"],
+            forward_out["interval_loss"],
+            forward_out["dag_loss"],
+            forward_out["kl_loss"]
         )
 
-        epistemic_uncertainty = gcn_kl_loss / batch_size  # 认知不确定性（KL损失量化）
-        aleatoric_uncertainty = y_pred_var.mean()  # 随机不确定性（预测方差均值）
-        total_uncertainty = epistemic_uncertainty + aleatoric_uncertainty
-
-        pred_dict = {
-            "y_pred_mean": y_pred_mean,  # 加工指标点估计
-            "y_pred_var": y_pred_var,  # 加工指标方差（随机不确定性）
-            "y_true": y_true,  # 加工指标真实值
-            "epistemic_uncertainty": epistemic_uncertainty,  # 认知不确定性
-            "aleatoric_uncertainty": aleatoric_uncertainty,  # 随机不确定性
-            "total_uncertainty": total_uncertainty,  # 总不确定性
-            "picp": picp,  # 预测区间覆盖率（文档4.2.2节）
-            "pinaw": pinaw,  # 归一化平均区间宽度（文档4.2.2节）
-            "new_gru_hidden": new_gru_hidden  # 新GRU隐藏状态（多道次切削传递）
-        }
-
-        loss_dict = {
-            "total_loss": total_loss,  # 总损失（公式15）
-            "elbo_loss": elbo_loss,  # ELBO损失（认知不确定性优化）
-            "recon_loss": l_rec,  # 重建损失（预测 accuracy）
-            "pi_loss": l_pi,  # PI损失（预测区间质量）
-            "causal_loss": l_z,  # 因果损失（因果关系稳定性）
-            "dag_loss": dag_loss  # DAG损失（因果结构有效性）
-        }
-
-        return pred_dict, loss_dict
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-4)
+        return optimizer
