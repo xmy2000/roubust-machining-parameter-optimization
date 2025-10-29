@@ -1,7 +1,5 @@
 import random
 import gymnasium as gym
-import numpy as np
-import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import os
@@ -10,7 +8,6 @@ import parameters as args
 from replay_buffer import ReplayBuffer
 from train_utils import *
 from network import Actor, SoftQNetwork
-
 
 run_name = f"version_3"
 
@@ -29,7 +26,6 @@ torch.backends.cudnn.deterministic = args.torch_deterministic
 
 device = torch.device("cpu")
 
-# env setup
 env = gym.make('CuttingEnv-v0')
 
 actor = Actor(env, args.num_objectives).to(device)
@@ -46,15 +42,12 @@ qf1_target.load_state_dict(qf1.state_dict())
 qf2_target.load_state_dict(qf2.state_dict())
 q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
 
-# eta = torch.tensor(1.0, requires_grad=False)
 eta = torch.tensor(1.0, requires_grad=True)
 eta_optimizer = optim.Adam([eta], lr=args.dual_lr)
 
 delta = torch.zeros((args.batch_size, 50), requires_grad=False)
 
-# Automatic entropy tuning
 if args.autotune:
-    # 计算离散动作和连续动作的目标熵
     discrete_target_entropy = 0
     for i in range(3):
         discrete_target_entropy += args.target_entropy_scale * torch.log(
@@ -82,11 +75,8 @@ rb = ReplayBuffer(
     handle_timeout_termination=False,
 )
 
-# 用于保存最佳模型的信息，(average_return, actor_filename, qf1_filename, qf2_filename)
 best_models_info = []
-# 记录每个评估周期内的所有回合回报
 episodic_returns = []
-# 评估周期（可以根据需要调整）
 evaluation_period = 10
 
 episode_length = 0
@@ -101,7 +91,6 @@ for global_step in range(args.total_timesteps):
     omega_da = omega_da.expand(args.batch_size, -1)
 
     omega_t = np.random.dirichlet(np.ones(args.num_objectives))
-    # ALGO LOGIC: put action logic here
     if global_step < args.learning_starts:
         (a1, a2, a3, a4) = env.action_space.sample()
         actions = np.array([a1, a2, a3, a4[0]])
@@ -112,7 +101,6 @@ for global_step in range(args.total_timesteps):
             actions, _ = adversary.get_action(torch.Tensor(obs_array).to(device), torch.Tensor(omega_t).to(device))
         actions = actions[0].detach().cpu().numpy()
 
-    # TRY NOT TO MODIFY: execute the game and log data.
     next_obs, _, terminations, truncations, infos = env.step(actions)
 
     next_obs_array = np.reshape(infos["obs_array"], (1, -1))
@@ -123,13 +111,6 @@ for global_step in range(args.total_timesteps):
 
     episode_length += 1
     episode_return += np.sum(rewards * omega_t).item()
-
-    # reward_efficiency = rewards[0]
-    # reward_tool = rewards[1]
-    # reward_quality = rewards[2]
-    # writer.add_scalar("charts/reward_efficiency", reward_efficiency, global_step)
-    # writer.add_scalar("charts/reward_tool", reward_tool, global_step)
-    # writer.add_scalar("charts/reward_quality", reward_quality, global_step)
 
     if done:
         print(
@@ -145,7 +126,6 @@ for global_step in range(args.total_timesteps):
 
     rb.add(obs_array, next_obs_array, actions, rewards, done, omega_t, infos, aleatory_std, epistemic_std)
 
-    # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
     if done:
         obs, infos = env.reset(seed=args.seed)
         obs_array = np.reshape(infos["obs_array"], (1, -1))
@@ -153,7 +133,6 @@ for global_step in range(args.total_timesteps):
         obs = next_obs
         obs_array = next_obs_array
 
-    # ALGO LOGIC: training.
     if global_step > args.learning_starts:
         data = rb.sample(args.batch_size)
         state = data.observations
@@ -175,7 +154,6 @@ for global_step in range(args.total_timesteps):
         )
         qf_loss_l1 = qf_loss_l1_rb + qf_loss_l1_da
         qf_loss_l2 = qf_loss_l2_rb + qf_loss_l2_da
-        # optimize the model
         qf_loss = (1 - args.beta) * qf_loss_l1 + args.beta * qf_loss_l2
         q_optimizer.zero_grad()
         qf_loss.backward()
@@ -190,7 +168,6 @@ for global_step in range(args.total_timesteps):
         actor_loss.backward()
         actor_optimizer.step()
 
-        # eta_loss = 0
         eta_loss = cal_eta_loss(eta, C_rb.detach(), C_da.detach())
         eta_optimizer.zero_grad()
         eta_loss.backward()
@@ -213,7 +190,6 @@ for global_step in range(args.total_timesteps):
             adversary_loss.backward()
             adversary_optimizer.step()
 
-        # update the target networks
         if global_step % args.target_network_frequency == 0:
             for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                 target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
@@ -238,11 +214,9 @@ for global_step in range(args.total_timesteps):
             hv_value = evaluate_hypervolume(actor, env)
             writer.add_scalar("metrics/hypervolume", hv_value.item(), global_step)
 
-        # 评估周期结束，计算平均回报并检查是否保存模型
         if episode_count % evaluation_period == 0 and len(episodic_returns) > 0:
             average_return = np.mean(episodic_returns)
 
-            # 保存新的模型信息
             folder_path = f"./models/{run_name}"
             if not os.path.exists(folder_path):
                 os.makedirs(folder_path, exist_ok=True)
@@ -251,7 +225,6 @@ for global_step in range(args.total_timesteps):
             qf2_filename = f"./models/{run_name}/qf2_model_step_{global_step}_return_{average_return:.2f}.pth"
 
             new_model_info = (average_return, actor_filename, qf1_filename, qf2_filename)
-            # 如果列表未满，直接添加
             if len(best_models_info) < 5:
                 best_models_info.append(new_model_info)
                 best_models_info.sort(key=lambda x: x[0], reverse=True)
@@ -259,9 +232,7 @@ for global_step in range(args.total_timesteps):
                 torch.save(qf1.state_dict(), qf1_filename)
                 torch.save(qf2.state_dict(), qf2_filename)
             else:
-                # 如果新模型比列表中最差的模型好，则替换
                 if average_return > best_models_info[-1][0]:
-                    # 删除旧的最差模型文件
                     _, old_actor_filename, old_qf1_filename, old_qf2_filename = (best_models_info.pop())
 
                     if os.path.exists(old_actor_filename):

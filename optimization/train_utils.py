@@ -8,9 +8,8 @@ import parameters as args
 
 
 def evaluate_hypervolume(actor, env):
-    """使用pymoo计算超体积"""
     reward_vectors = []
-    eval_env = copy.deepcopy(env)  # 独立评估环境
+    eval_env = copy.deepcopy(env)
 
     for _ in range(args.NUM_EVAL_EPISODES):
         obs, infos = eval_env.reset()
@@ -19,9 +18,7 @@ def evaluate_hypervolume(actor, env):
         done = False
 
         while not done:
-            # 评估时用确定性策略（无探索噪声）
             with torch.no_grad():
-                # 生成均匀分布的偏好权重（覆盖多目标空间）
                 omega = np.random.dirichlet(np.ones(args.num_objectives))
                 actions, _ = actor.get_action(
                     torch.Tensor(obs_array),
@@ -30,18 +27,16 @@ def evaluate_hypervolume(actor, env):
             actions = actions[0].cpu().numpy()
 
             next_obs, _, terminations, truncations, infos = eval_env.step(actions)
-            rewards = infos["reward_vector"]  # 多目标奖励向量
+            rewards = infos["reward_vector"]
             episode_rewards.append(rewards)
             done = terminations or truncations
             obs_array = np.reshape(infos["obs_array"], (1, -1))
 
-        # 累计episode总奖励向量
         total_reward = np.sum(episode_rewards, axis=0)
         reward_vectors.append(total_reward)
 
     eval_env.close()
 
-    # 使用pymoo计算超体积
     if not reward_vectors:
         return 0.0
     solutions = np.array(reward_vectors)
@@ -63,11 +58,10 @@ def compute_robustness_constraint(actor, state, preference, original_action, std
     perturbed_state = state.clone().detach()
     delta = delta.clone().detach().requires_grad_(True)
 
-    # 不确定性扰动
-    # tool_wear_mu = state[:, args.tool_wear_idx]
-    # tool_wear = tool_wear_mu + stds * torch.randn_like(tool_wear_mu)
-    # tool_wear = torch.clamp(tool_wear, min=0.1)
-    # perturbed_state[:, args.tool_wear_idx] = tool_wear
+    tool_wear_mu = state[:, args.tool_wear_idx]
+    tool_wear = tool_wear_mu + stds * torch.randn_like(tool_wear_mu)
+    tool_wear = torch.clamp(tool_wear, min=0.1)
+    perturbed_state[:, args.tool_wear_idx] = tool_wear
     perturbed_state = (1 - torch.randn_like(state) * args.zeta) * state
 
     perturbed_state = perturbed_state + delta
@@ -143,7 +137,6 @@ def cal_actor_loss(
         action_adv_rb, log_prob_adv_rb = adversary.get_action(state, omega_rb)
         action_adv_da, log_prob_adv_da = adversary.get_action(state, omega_da)
 
-    # 策略鲁棒性约束
     C_rb, delta_update = compute_robustness_constraint(actor, state, omega_rb, action_rb, stds, delta)
     C_da, _ = compute_robustness_constraint(actor, state, omega_da, action_da, stds, delta)
 

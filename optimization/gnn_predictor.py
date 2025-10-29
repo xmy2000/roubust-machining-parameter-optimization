@@ -6,8 +6,6 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import to_undirected
 
-from UQ_Model.BGNN_v3 import Model
-
 NODES = ["cut_count", "feature", "tool", "tool_wear", "tool_breakage", "allowance", "feature_size", "depth",
          "cut", "roughness", "cut_setting"]
 predict_nodes = ["tool_wear", "tool_breakage", "cut", "roughness"]
@@ -89,7 +87,6 @@ class GNNPredictor:
             result[node] = {}
             epistemic_samples[node] = []
 
-        """认知不确定性评估"""
         self.model.graph_encoder.conv1.lin.unfreeze()
         self.model.graph_encoder.conv2.lin.unfreeze()
         for _ in range(num_samples):
@@ -108,7 +105,6 @@ class GNNPredictor:
                 result[k].update({"epistemic_samples": v})
                 result[k].update({"epistemic_std": samples.std().item()})
 
-        """随机不确定性评估"""
         self.model.graph_encoder.conv1.lin.freeze()
         self.model.graph_encoder.conv2.lin.freeze()
         x_decode, x_std = self.forward(loader)
@@ -140,14 +136,6 @@ class GNNPredictor:
         return model
 
     def create_graph_data(self, data):
-        """
-        data.keys = [
-            cut_count, feature_type, cutting_type, material,
-            tool_type, tool_radius, tool_degree, tool_length, tool_extension, tool_supplier,
-            tool_wear, tool_breakage, allowance, feature_size, depth, cut, roughness, machine,
-            machine_type, feed, rotate, cutting_distance
-        ]
-        """
         for k, v in data.items():
             if k in numerical_vars:
                 data[k] = [(data[k] - numerical_vars[k][0]) / numerical_vars[k][1]]
@@ -207,25 +195,3 @@ class GNNPredictor:
         )
         return graph
 
-
-if __name__ == "__main__":
-    predictor = GNNPredictor("./checkpoints/only_test.ckpt")
-    # print(predictor.model.adj_matrix)
-
-    data = {
-        "cut_count": 1, "feature_type": 1, "cutting_type": 1, "material": 0,
-        "tool_type": 0, "tool_radius": 0.8, "tool_degree": 35, "tool_length": 110,
-        "tool_extension": 1, "tool_supplier": 2, "tool_wear": 0, "tool_breakage": 1,
-        "allowance": 0, "feature_size": 0, "depth": 0.8, "cut": 0.1,
-        "roughness": 1.6, "machine": 1, "machine_type": 0, "feed": 0.108, "rotate": 20, "cutting_distance": 12
-    }
-    # graph = predictor.create_graph_data(data)
-    # print(graph)
-
-    result = predictor.predict_with_uncertainty(data)
-    for k, v in result.items():
-        if k == 'tool_breakage':
-            print(f"{k}: {v['mean']}")
-        else:
-            print(f"{k}: {v['mean']}; {v['aleatory_std']}; {v['epistemic_std']}")
-    # print(predictor.global_memory)
